@@ -1,0 +1,12 @@
+services:
+  ais-collision:
+    build: .
+    container_name: ais-collision
+    working_dir: /app
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./:/app
+      - ./data/raw:/data/raw
+      - ./output:/app/output
+    command: bash
