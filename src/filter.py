@@ -26,7 +26,7 @@ def create_spark(app_name: str = "ais-filter", n_cores: int = 4) -> SparkSession
         SparkSession.builder
         .appName(app_name)
         .master(f"local[{n_cores}]")
-        .config("spark.sql.shuffle.partitions", str(max(100, n_cores * 4)))
+        .config("spark.sql.shuffle.partitions", str(max(200, n_cores * 4)))
         .config("spark.default.parallelism", str(max(8, n_cores * 4)))
         .getOrCreate()
     )
@@ -259,7 +259,16 @@ def write_single_csv(df: DataFrame, final_csv_path: str) -> None:
 
 
 def process_one_file_to_same_name(spark: SparkSession, input_file: str, output_dir: str) -> str:
-    df = filter_one_file(spark, input_file)
+    # 1. Determine the exact output path first
     output_path = Path(output_dir) / Path(input_file).name
+
+    # 2. Check if it already exists to bypass Spark processing
+    if output_path.exists():
+        print(f"Skipped filtering: {output_path} already exists.")
+        return str(output_path)
+
+    # 3. If it doesn't exist, run the heavy processing and write the file
+    df = filter_one_file(spark, input_file)
     write_single_csv(df, str(output_path))
+
     return str(output_path)

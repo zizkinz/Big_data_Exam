@@ -5,6 +5,7 @@ import shutil
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+
 from pyspark.sql import Window
 
 from filter import create_spark, maritime_distance_expr
@@ -337,28 +338,35 @@ def add_sog_proportion(tracks_df):
         .withColumn("mean_sog_before", F.coalesce(F.col("mean_sog_before"), F.lit(0.01)))
         .withColumn("mean_sog_after", F.coalesce(F.col("mean_sog_after"), F.lit(0.01)))
         .withColumn("sog_proportion", F.col("mean_sog_before") / F.col("mean_sog_after"))
+        .select("mmsi", "pair_id", "sog_proportion")
     )
 
-    pair_stats = (
+    filtered_stats = (
         sog_stats
         .groupBy("pair_id")
         .agg(
-            F.avg("sog_proportion").alias("pair_sog_proportion"),
-            F.min("sog_proportion").alias("pair_min_sog_proportion"),
-            F.count("*").alias("n_vessels")
+            F.min("sog_proportion").alias("min_pair_proportion"),
+            F.avg("sog_proportion").alias("mean_pair_proportion")
         )
-        .filter(F.col("n_vessels") == 2)
-        .filter(F.col("pair_min_sog_proportion") >= 1.1)
-        .select("pair_id", "pair_sog_proportion")
+        # Apply your filter condition on the aggregated minimum proportion
+        .filter(F.col("min_pair_proportion") >= 1.1)
+        # Select only the pair_id and the mean_pair_proportion
+        .select("pair_id", "mean_pair_proportion")
     )
 
     return (
         tracks_df
-        .join(pair_stats, on="pair_id", how="inner")
+        .join(filtered_stats, on="pair_id", how="inner")
     )
 
 
 def process_date(spark: SparkSession, date_str: str, filtered_dir: str, collisions_dir: str, output_dir: str):
+    output_path = str(Path(output_dir) / f"aisdk-{date_str}.csv")
+
+    if Path(output_path).exists():
+        print(f"Skipped collision tracks extraction: {output_path} already exists.")
+        return output_path
+
     filtered_file = str(Path(filtered_dir) / f"aisdk-{date_str}.csv")
     collision_file = str(Path(collisions_dir) / f"aisdk-{date_str}.csv")
 
@@ -366,11 +374,18 @@ def process_date(spark: SparkSession, date_str: str, filtered_dir: str, collisio
     candidates_df = load_collision_candidates(spark, collision_file)
     confirmed_df = find_confirmed_collision_times(filtered_df, candidates_df)
     tracks_df = extract_collision_tracks(filtered_df, confirmed_df)
+
+    tracks_df = tracks_df.localCheckpoint(eager=True)
+
     tracks_df = add_sog_proportion(tracks_df)
 
-    output_path = str(Path(output_dir) / f"aisdk-{date_str}.csv")
     write_single_csv(tracks_df, output_path)
+
+    spark.catalog.clearCache()
     return output_path
+
+
+
 
 
 def parse_args():

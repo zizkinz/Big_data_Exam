@@ -164,13 +164,17 @@ def write_single_csv(df: DataFrame, final_csv_path: str) -> None:
     shutil.rmtree(temp_dir)
 
 
-def process_one_filtered_file(
-    spark: SparkSession,
-    input_file: str,
-    output_dir: str = DEFAULT_COLLISIONS_DIR
-) -> str:
+def process_one_filtered_file(spark: SparkSession, input_file: str,output_dir: str = DEFAULT_COLLISIONS_DIR) -> str:
+
+    output_path = Path(output_dir) / Path(input_file).name
+
+    if output_path.exists():
+        print(f"Skipped collision finding: {output_path} already exists.")
+        return str(output_path)
+
     df = load_filtered_day(spark, input_file)
     collisions = find_collision_candidates(df)
-    output_path = Path(output_dir) / Path(input_file).name
+
     write_single_csv(collisions, str(output_path))
     return str(output_path)
+
