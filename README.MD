@@ -191,15 +191,16 @@ Running `main.py` should orchestrate these steps automatically with the correct 
 ## Top Ranked Collision Event
 
 The pipeline identifies one event as the most severe collision in the dataset, with an average proportional speed decrease of approximately **300.99** times across the involved vessels (`mean_pair_proportion ≈ 300.99`).\
-This event involves the vessels **KARIN HOEJ** (MMSI `219021240`) and **MV SCOT CARRIER** (MMSI `232018267`) near coordinates **55.223067° N, 14.243730° E** at timestamp **2021‑12‑13T02:27:29Z**. [<file:25>]
+This event involves the vessels **KARIN HOEJ** (MMSI `219021240`) and **MV SCOT CARRIER** (MMSI `232018267`) near coordinates **55.223067° N, 14.243730° E** at timestamp **2021‑12‑13T02:27:29Z**.
 
 The trajectories reconstructed by the pipeline show MV SCOT CARRIER (blue track) following a curved path, initially sailing southward and then gradually turning and straightening as it proceeds eastward along a relatively steady course.\
-KARIN HOEJ (red track), in contrast, approaches on a more direct, nearly straight line from the northeast towards the impact area, intersecting the path of MV SCOT CARRIER at the collision point. [<file:25>]
+KARIN HOEJ (red track), in contrast, approaches on a more direct, nearly straight line from the northeast towards the impact area, intersecting the path of MV SCOT CARRIER at the collision point.
 
 The collision map below visualizes the interpolated paths and the impact point used in the analysis.\
 The start of each trajectory is marked with a filled circle, while the collision point is shown as a red cross at the location where the interpolated separation distance dropped below 100 meters and the subsequent speed behavior satisfied the ≥10% SOG decrease rule (the transponder of KARIN HOEJ went offline right after the collision).
 
-![Collision Trajectory Map](collision_map.jpg)
+![Collision Trajectory Map](https://github.com/zizkinz/Big_data_Exam/blob/main/collision_map.png "The tracks of the vessels of the top collision")
+
 
 
 docker compose up --build -d
