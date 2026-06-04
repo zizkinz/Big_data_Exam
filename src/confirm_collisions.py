@@ -54,6 +54,32 @@ def load_collision_candidates(spark: SparkSession, file_path: str):
         )
     )
 
+def write_single_csv(df, final_csv_path: str) -> None:
+    # Combine the temporary Spark files into a single one day output file
+    final_path = Path(final_csv_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_dir = final_path.with_suffix(".tmpdir")
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    if final_path.exists():
+        final_path.unlink()
+
+    (
+        df.coalesce(1)
+          .write
+          .mode("overwrite")
+          .option("header", True)
+          .csv(str(temp_dir))
+    )
+
+    part_files = list(temp_dir.glob("part-*.csv"))
+    if not part_files:
+        raise FileNotFoundError(f"No Spark CSV part file found in temporary directory: {temp_dir}")
+
+    shutil.move(str(part_files[0]), str(final_path))
+    shutil.rmtree(temp_dir)
+
 def build_segments(points_df, ts_col_prefix: str):
     # For each point find the next observed point for the same vessel pair
     start_ts = f"{ts_col_prefix}_start_ts"
@@ -347,31 +373,7 @@ def add_sog_proportion(tracks_df):
     )
 
 
-def write_single_csv(df, final_csv_path: str) -> None:
-    # Combine the temporary Spark files into a single one day output file
-    final_path = Path(final_csv_path)
-    final_path.parent.mkdir(parents=True, exist_ok=True)
 
-    temp_dir = final_path.with_suffix(".tmpdir")
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
-    if final_path.exists():
-        final_path.unlink()
-
-    (
-        df.coalesce(1)
-          .write
-          .mode("overwrite")
-          .option("header", True)
-          .csv(str(temp_dir))
-    )
-
-    part_files = list(temp_dir.glob("part-*.csv"))
-    if not part_files:
-        raise FileNotFoundError(f"No Spark CSV part file found in temporary directory: {temp_dir}")
-
-    shutil.move(str(part_files[0]), str(final_path))
-    shutil.rmtree(temp_dir)
 
 
 def process_date(spark: SparkSession, date_str: str, filtered_dir: str, collisions_dir: str, output_dir: str):
