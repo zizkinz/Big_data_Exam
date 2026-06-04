@@ -1,12 +1,12 @@
 services:
   ais-collision:
     build: .
+    image: maksimciz/ais-collision:1.0.0
     container_name: ais-collision
     working_dir: /app
     tty: true
     stdin_open: true
     volumes:
-      - ./:/app
-      - ./data/raw:/data/raw
+      - ./data/raw:/data/raw:ro
       - ./output:/app/output
     command: bash

@@ -45,6 +45,93 @@ Big_data_Exam/
 
 ------------------------------------------------------------------------
 
+## Easy Run Guide
+
+The Docker image for this project is available on Docker Hub as `maksimciz/ais-collision:1.0.0`. Pulling that image gives a ready-to-run multi-architecture container (ARM64 and AMD64) with the code and dependencies already included.
+
+This guide shows how to run the Docker image from scratch, even if there is no local Git repository and no local copy of the image. Only the input and output folders are needed on the host machine.
+
+## 1. Create a project directory
+
+Create a working folder anywhere on the machine and move into it:
+
+```bash
+mkdir -p ~/ais-collision
+cd ~/ais-collision
+```
+This folder will hold the input data and the output files for the container.
+
+## 2. Create the raw data directory
+
+Create the exact input folder structure expected by the app:
+
+```bash
+mkdir -p data/raw/aisdk-2021-12
+```
+
+Now copy the AIS CSV files into that folder so the structure looks like this:
+
+```text
+data/raw/aisdk-2021-12/
+  aisdk-2021-12-01.csv
+  aisdk-2021-12-02.csv
+  ...
+```
+
+The application looks under `/data/raw/aisdk-2021-12` for files matching `aisdk-2021-12*.csv`, so the host folder must mirror that structure exactly once mounted into the container.
+
+## 3. Create the output directory
+
+Create a folder for generated results:
+
+```bash
+mkdir -p output
+```
+
+Anything written by the container to `/app/output` will appear in this local `output` folder.
+
+## 4. Pull the Docker Hub image
+
+Download the published image:
+
+```bash
+docker pull maksimciz/ais-collision:1.0.0
+```
+
+This pulls the complete application image, including the Python code and installed dependencies.
+
+## 5. Run the app
+
+Start the container with the input and output folders mounted:
+
+```bash
+docker run --rm -it \
+  -v "$(pwd)/data/raw:/data/raw:ro" \
+  -v "$(pwd)/output:/app/output" \
+  maksimciz/ais-collision:1.0.0 \
+  bash
+```
+
+This command mounts the local raw-data folder to `/data/raw` as read-only and mounts the local output folder to `/app/output` inside the container.
+
+
+Now, run the app itself:
+
+```bash
+python /app/src/main.py --input /data/raw --pattern 'aisdk-2021-12*.csv'
+```
+
+## 7. Find the output
+
+When the run finishes, the results will be in the local project folder here:
+
+```text
+~/ais-collision/output
+```
+
+
+------------------------------------------------------------------------
+
 ## Pipeline Overview
 
 The full workflow is orchestrated by `main.py`. It runs a sequence of PySpark jobs that:
@@ -116,7 +203,7 @@ The result is a set of candidate vessel pairs with time windows and approximate 
     -   For each candidate vessel pair, trajectories over the relevant 20-minute window are interpolated.
     -   This yields a more fine-grained representation of each vessel’s path during the encounter.
 2.  **Collision confirmation (100 m threshold):**
-    -   For every second in the interpolated window, the distance between the two vessels tarjectories is computed.
+    -   For every second in the interpolated window, the distance between the two vessels traectories is computed.
     -   A “collision event” is mapped if at least one point in the window has the distance strictly below **100 meters** (as vessels themselves can be longer than a 100 meters, so a collision might result in a non-zero distance between the two corresponding transponders).
 3.  **Speed-over-ground (SOG) analysis before and after collision:**
     -   For each confirmed collision event, the mean SOG is separately calculated for both vessels before and after the collision time.
@@ -137,7 +224,7 @@ Only events that pass both the distance criterion (100 m) and the speed-change c
 2.  Computes summary statistics for each collision event, including the **average speed decrease after the collision** (across both vessels, according to the rules in `confirm_collisions.py`).
 3.  Sorts the events in **descending order** of average speed decrease, so that the most severe collisions (largest speed drop) appear first.
 
-The aggregated and ranked output is written to `data/output/all_collisions.csv` (or the path specified in `config.yaml`).
+The aggregated and ranked output is written to `output/all_collisions.csv` (or the path specified in `config.yaml`).
 
 ------------------------------------------------------------------------
 
@@ -145,40 +232,13 @@ The aggregated and ranked output is written to `data/output/all_collisions.csv` 
 
 `visualize_top_collision.py` takes the top-ranked collision event from the aggregated list and produces a visual map:
 
--   Reads the top event from `data/output/all_collisions.csv`.
+-   Reads the top event from `output/all_collisions.csv`.
 -   Extracts the trajectories of the two vessels involved.
 -   Plots the paths on a map, including:
     -   Vessel tracks over the collision window.
     -   The approximate collision point where the interpolated distance was the lowest.
 
-The output is a picture (`data/output/top_collision.png`) depicting the collision event.
-
-------------------------------------------------------------------------
-
-## Running the Whole Pipeline Step by Step
-
-Although `main.py` can run the pipeline end-to-end, each step can also be executed separately for debugging or experimentation.
-
-Examples (adapt paths and arguments as needed):
-
-``` bash
-# 1. Filter raw data
-spark-submit src/filter.py --config config/config.yaml
-
-# 2. Find collision candidates (150 m, 20-min windows)
-spark-submit src/find_collisions.py --config config/config.yaml
-
-# 3. Confirm collisions (100 m + SOG rules)
-spark-submit src/confirm_collisions.py --config config/config.yaml
-
-# 4. Combine and rank tracks
-spark-submit src/combine_tracks.py --config config/config.yaml
-
-# 5. Visualize the top collision
-python src/visualization/visualize_top_collision.py --config config/config.yaml
-```
-
-Running `main.py` should orchestrate these steps automatically with the correct sequence and dependencies.
+The output is a picture (`output/top_collision.png`) depicting the collision event.
 
 ------------------------------------------------------------------------
 
@@ -200,9 +260,3 @@ The collision map below visualizes the interpolated paths and the impact point u
 The start of each trajectory is marked with a filled circle, while the collision point is shown as a red cross at the location where the interpolated separation distance dropped below 100 meters and the subsequent speed behavior satisfied the ≥10% SOG decrease rule (the transponder of KARIN HOEJ went offline right after the collision).
 
 ![Collision Trajectory Map](https://github.com/zizkinz/Big_data_Exam/blob/main/collision_map.png "The tracks of the vessels of the top collision")
-
-
-
-docker compose up --build -d
-docker compose exec ais-collision bash
-spark-submit src/main.py
