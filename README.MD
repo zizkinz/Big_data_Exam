@@ -3,46 +3,32 @@
 ``` text
 Big_data_Exam/
 ├─ data/
-│  ├─ raw/                     # Original AIS data
-│  ├─ filtered/                # Non-stationary vessel data
-│  ├─ collisions_local/        # Candidate collision pairs from 20-min windows
-│  ├─ collisions_confirmed/    # Collisions confirmed after path interpolation
-│  └─ output/
-│     ├─ all_collisions.csv    # Final ranked list of collision events
-│     └─ top_collision.png     # Visualization of the top collision event
+│  ├─ raw/                       # Original AIS data
+│  ├─ filtered/                  # Non-stationary vessel data
+│  ├─ collisions/                # Candidate collision pairs from 10-min windows
+│  └─ collisions_tracks/         # Collisions confirmed after path interpolation
+├─ output/
+│  ├─ all_collisions.csv         # Final ranked list of collision events
+│  └─ top_collision.png          # Visualization of the top collision event
 ├─ src/
-│  ├─ main.py                  # Orchestrator: runs the full pipeline in order
-│  ├─ filter.py                # Daily data cleaning and quality filtering
-│  ├─ find_collisions.py       # Local cross-joins within 20-min windows (150 m)
-│  ├─ confirm_collisions.py    # Path interpolation + 100 m threshold + SOG rule
-│  └─ combine_tracks.py        # Aggregates confirmed collisions and ranks them
-├─ src/visualization/
-│  └─ visualize_top_collision.py  # Draws a map for the top-ranked collision
-├─ config/
-│  └─ config.yaml              # Paths, Spark config, and pipeline parameters
-├─ requirements.txt            # Python dependencies (PySpark, plotting libs, etc.)
-└─ README.md                   # This file
+│  ├─ main.py                    # Orchestrator: runs the full pipeline in order
+│  ├─ filter.py                  # Daily data cleaning and quality filtering
+│  ├─ find_collisions.py         # Local cross-joins within 10-min windows (150 m)
+│  ├─ confirm_collisions.py      # Path interpolation + 100 m threshold + SOG rule
+│  ├─ combine_tracks.py          # Aggregates confirmed collisions and ranks them
+│  └─ visualize_top_collision.py # Draws a map for the top-ranked collision
+├─ docker-compose.yml            # Defines the docker volumes
+├─ Dockerfile                    # Docker image build settings
+├─ requirements.txt              # Python dependencies (PySpark, plotting libs, etc.)
+└─ README.md                     # This file
 ```
 
 ------------------------------------------------------------------------
 
 ## Requirements
 
--   Python 3.x
-
--   PySpark
-
--   Standard scientific stack: `pandas`, `numpy`
-
--   Geospatial / plotting libraries used in `visualize_top_collision.py`, e.g.:
-
-    -   `matplotlib`
-
--   A working Spark environment:
-
-    -   Local (`--master local[*]`) or
-    -   Cluster, as configured in `config.yaml`
-
+-   Docker Desktop
+-   AIS input files
 ------------------------------------------------------------------------
 
 ## Easy Run Guide
@@ -118,7 +104,7 @@ This command mounts the local raw-data folder to `/data/raw` as read-only and mo
 Now, run the app itself:
 
 ```bash
-python /app/src/main.py --input /data/raw --pattern 'aisdk-2021-12*.csv'
+spark-submit src/main.py
 ```
 
 ## 7. Find the output
@@ -137,18 +123,10 @@ When the run finishes, the results will be in the local project folder here:
 The full workflow is orchestrated by `main.py`. It runs a sequence of PySpark jobs that:
 
 1.  Filter raw AIS data day by day to remove clearly invalid or unusable records.
-2.  Identify candidate vessel encounters where two ships come within 150 m of each other inside overlapping 20-minute windows via cross-joins.
+2.  Identify candidate vessel encounters where two ships come within 150 m of each other inside overlapping 10-minute windows via cross-joins.
 3.  Confirm which of these encounters are likely collisions by interpolating vessel trajectories, applying a stricter 100 m distance threshold, and analyzing speed changes.
 4.  Aggregate all confirmed collision tracks into a single file and rank them by severity (average speed decrease).
 5.  Visualize the top-ranked collision event on a map.
-
-At a high level:
-
-``` bash
-spark-submit src/main.py --config config/config.yaml
-```
-
-will perform the entire pipeline, from filtering to visualization
 
 ------------------------------------------------------------------------
 
@@ -158,53 +136,50 @@ will perform the entire pipeline, from filtering to visualization
 
 `main.py` is the main script in the project. It:
 
--   Initializes Spark with the configuration specified in `config/config.yaml`
+-   Initializes Spark
 -   Orchestrates the sequential execution of the following steps:
     1.  Daily filtering (`filter.py`)
     2.  Collision candidate search (`find_collisions.py`)
     3.  Collision confirmation and speed analysis (`confirm_collisions.py`)
     4.  Aggregation and ranking of collision tracks (`combine_tracks.py`)
-    5.  Optional visualization of the top collision (`visualize_top_collision.py`)
-
-The script wires the I/O paths between steps (e.g., `filtered/` → `collisions_local/` → `collisions_confirmed/` → `output/`).
+    5.  Visualization of the top collision (`visualize_top_collision.py`)
 
 ------------------------------------------------------------------------
 
 ### `filter.py` – Daily AIS Data Filtering
 
-`filter.py` takes raw AIS data, partitions it by day, and applies a set of quality rules to remove incorrect records. Typical rules (as implemented in the code) include, for example:
-
+`filter.py` takes raw AIS data, and applies a set of quality rules to remove incorrect records, such as:
 -   Dropping rows with missing or obviously invalid coordinates and/or MMSI values.
--   Filtering out impossible speeds, headings, or timestamps.
+-   Filtering out impossible speeds or coordinates.
 -   Removing vessels having stationary status.
 
 The output is a cleaned dataset per day in `data/filtered/`, which serves as the input for collision detection.
 
 ------------------------------------------------------------------------
 
-### `find_collisions.py` – Local Cross-Joins on 20-Minute Windows (150 m)
+### `find_collisions.py` – Local Cross-Joins on 10-Minute Windows (150 m)
 
-`find_collisions.py` operates on the filtered AIS data. Conceptually, it:
+`find_collisions.py` operates on the filtered AIS data, it:
 
-1.  Builds overlapping 20-minute time windows for each vessel’s trajectory.
+1.  Builds overlapping 10-minute time windows for each vessel’s trajectory.
 2.  Within each window, performs local cross-joins between vessel positions so that only vessels that are temporally close are considered together.
 3.  Computes pairwise distances between vessels in the same window.
-4.  Flags “collision candidates” when two vessels come closer than **150 meters** at some point inside the 20-minute window (according to the distance calculation implemented in the code).
+4.  Flags “collision candidates” when two vessels come closer than **150 meters** at some point inside the 10-minute window.
 
-The result is a set of candidate vessel pairs with time windows and approximate locations where a potential collision might have occurred. These are stored in `data/collisions_local/`.
+The result is a set of candidate vessel pairs with time windows and approximate locations where a potential collision might have occurred. These are stored in `data/collisions/`.
 
 ------------------------------------------------------------------------
 
 ### `confirm_collisions.py` – Path Interpolation, 100 m Threshold, and SOG Rule
 
-`confirm_collisions.py` takes the candidate encounters and applies a stricter, more physically meaningful analysis:
+`confirm_collisions.py` takes the candidate encounters and applies a stricter analysis:
 
 1.  **Path interpolation (20-minute window):**
     -   For each candidate vessel pair, trajectories over the relevant 20-minute window are interpolated.
     -   This yields a more fine-grained representation of each vessel’s path during the encounter.
 2.  **Collision confirmation (100 m threshold):**
-    -   For every second in the interpolated window, the distance between the two vessels traectories is computed.
-    -   A “collision event” is mapped if at least one point in the window has the distance strictly below **100 meters** (as vessels themselves can be longer than a 100 meters, so a collision might result in a non-zero distance between the two corresponding transponders).
+    -   For every second in the interpolated window, the distance between the two vessels trajectories is computed.
+    -   A “collision event” is mapped if at least one point in the window has the distance below **100 meters** (as vessels themselves can be longer than a 100 meters, so a collision might result in a non-zero distance between the two corresponding transponders).
 3.  **Speed-over-ground (SOG) analysis before and after collision:**
     -   For each confirmed collision event, the mean SOG is separately calculated for both vessels before and after the collision time.
     -   If the decrease in mean SOG after the collision is less than **10%** for a vessel pair, or if both vessels have increased their speed, the event is discarded as a likely non-collision.
@@ -221,10 +196,9 @@ Only events that pass both the distance criterion (100 m) and the speed-change c
 `combine_tracks.py` collects all confirmed collision events and:
 
 1.  Merges them into a single dataset.
-2.  Computes summary statistics for each collision event, including the **average speed decrease after the collision** (across both vessels, according to the rules in `confirm_collisions.py`).
-3.  Sorts the events in **descending order** of average speed decrease, so that the most severe collisions (largest speed drop) appear first.
+2.  Sorts the events in **descending order** of average speed decrease, so that the most severe collisions (largest speed drop) appear first.
 
-The aggregated and ranked output is written to `output/all_collisions.csv` (or the path specified in `config.yaml`).
+The aggregated and ranked output is written to `output/all_collisions.csv`.
 
 ------------------------------------------------------------------------
 
@@ -250,7 +224,7 @@ The output is a picture (`output/top_collision.png`) depicting the collision eve
 
 ## Top Ranked Collision Event
 
-The pipeline identifies one event as the most severe collision in the dataset, with an average proportional speed decrease of approximately **300.99** times across the involved vessels (`mean_pair_proportion ≈ 300.99`).\
+Between the 1st and 31st of december 2021, the pipeline identifies one event as the most severe collision in the dataset, with an average proportional speed decrease of approximately **300.99** times across the involved vessels (`mean_pair_proportion ≈ 300.99`).\
 This event involves the vessels **KARIN HOEJ** (MMSI `219021240`) and **MV SCOT CARRIER** (MMSI `232018267`) near coordinates **55.223067° N, 14.243730° E** at timestamp **2021‑12‑13T02:27:29Z**.
 
 The trajectories reconstructed by the pipeline show MV SCOT CARRIER (blue track) following a curved path, initially sailing southward and then gradually turning and straightening as it proceeds eastward along a relatively steady course.\
