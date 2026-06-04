@@ -6,15 +6,22 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+# Center point and filter radius as described in the assignment
 CENTER_LAT = 55.225000
 CENTER_LON = 14.245000
 RADIUS_NM = 50.0
 
+
+# Minimum SOG for a vessel to be considered non-stationary
 MOVING_SOG_MIN = 2
+# Minimum step for a vessel to be considered non-stationary
 MOVING_STEP_NM_MIN = 0.02
+# Maximum SOG for a raw to be considered valid
 MAX_SOG_KNOTS = 40.0
+# Maximum step for a vessel to be considered valid
 MAX_STEP_NM = 5.0
 
+# Known invalid MMSI patterns that should be filtered as invalid
 SEQUENCE_INVALID = {
     "123456789", "987654321", "111111111", "222222222", "333333333",
     "444444444", "555555555", "666666666", "777777777", "888888888", "999999999"
@@ -22,6 +29,8 @@ SEQUENCE_INVALID = {
 
 
 def create_spark(app_name: str = "ais-filter", n_cores: int = 4) -> SparkSession:
+    # Create a local Spark session for parallel day file processing
+
     spark = (
         SparkSession.builder
         .appName(app_name)
@@ -35,6 +44,7 @@ def create_spark(app_name: str = "ais-filter", n_cores: int = 4) -> SparkSession
 
 
 def maritime_distance_expr(lat1_col, lon1_col, lat2_col, lon2_col):
+    # Great-circle distance in nautical miles using the haversine formula
     radius_nm = 3440.065
 
     lat1 = F.radians(lat1_col)
@@ -55,6 +65,7 @@ def maritime_distance_expr(lat1_col, lon1_col, lat2_col, lon2_col):
 
 
 def clean_columns(df: DataFrame) -> DataFrame:
+    # Normalize raw AIS column names into consistent naming.
     rename_map = {
         "# Timestamp": "timestamp",
         "Type of mobile": "type_of_mobile",
@@ -88,6 +99,7 @@ def clean_columns(df: DataFrame) -> DataFrame:
 
 
 def read_and_standardize_csv(spark: SparkSession, file_path: str) -> DataFrame:
+    # Read the raw day CSV and cast the columns into usable types
     df = spark.read.option("header", True).csv(file_path)
     df = clean_columns(df)
 
@@ -106,7 +118,8 @@ def read_and_standardize_csv(spark: SparkSession, file_path: str) -> DataFrame:
 
 
 def filter_invalid_rows(df: DataFrame) -> DataFrame:
-
+    # Exclude rows with missing/impossible coordinates, bad MMSIs, and likely
+    # emergency/rescue vessel names that are outside the regular traffic
     rescue_pattern = r"(?i)(rescue|sar|pilot|coast guard|guard|lifeboat|redning|raddning|pobl)"
 
     return df.filter(
@@ -129,6 +142,8 @@ def filter_geographic_area(
     center_lon: float = CENTER_LON,
     radius_nm: float = RADIUS_NM
 ) -> DataFrame:
+    # First apply a fast latitude/longitude box filter to filter the data.
+
     lat_buffer = radius_nm / 60.0
     lon_buffer = radius_nm / (60.0 * math.cos(math.radians(center_lat)))
 
@@ -138,6 +153,7 @@ def filter_geographic_area(
     )
 
     return (
+    # Then compute the more accurate haversine distance and for a circular radius
         df.withColumn(
             "distance_to_center_nm",
             maritime_distance_expr(
@@ -152,6 +168,8 @@ def filter_geographic_area(
 
 
 def filter_stationary_and_noisy(df: DataFrame) -> DataFrame:
+    # Build vessel-wise track history so each AIS point can be compared to
+    # the previous point from the same MMSI
     w = Window.partitionBy("mmsi").orderBy("timestamp")
 
 
@@ -182,6 +200,9 @@ def filter_stationary_and_noisy(df: DataFrame) -> DataFrame:
           )
     )
 
+    # Statuses that usually represent anchored, moored, disabled, or otherwise
+    # stationary behavior that has to be filtered out.
+
     stationary_statuses = [
         "At anchor",
         "Moored",
@@ -191,11 +212,15 @@ def filter_stationary_and_noisy(df: DataFrame) -> DataFrame:
         "Engaged in fishing"
     ]
 
+    # A row is treated as moving if either reported SOG is high enough or
+    # the vessel actually changed position enough between two consequitive points
     moving_expr = (
         (F.coalesce(F.col("sog"), F.lit(0.0)) >= MOVING_SOG_MIN) |
         (F.coalesce(F.col("step_distance_nm"), F.lit(0.0)) >= MOVING_STEP_NM_MIN)
     )
 
+    # Remove obviously implausible jumps by checking time spacing, step length,
+    # and the speed implied by consecutive positions.
     plausible_expr = (
         F.col("prev_timestamp").isNull() |
         (
@@ -224,15 +249,18 @@ def select_output_columns(df: DataFrame) -> DataFrame:
 
 
 def filter_one_file(spark: SparkSession, file_path: str) -> DataFrame:
+    # Full filtering pipeline for one AIS day file
     df = read_and_standardize_csv(spark, file_path)
     df = filter_invalid_rows(df)
     df = filter_geographic_area(df)
     df = filter_stationary_and_noisy(df)
     df = select_output_columns(df)
+    # Remove exact duplicate observation points
     return df.dropDuplicates(["timestamp", "mmsi", "latitude", "longitude"])
 
 
 def write_single_csv(df: DataFrame, final_csv_path: str) -> None:
+    # Combine the temporary Spark files into a single one day output file
     final_path = Path(final_csv_path)
     final_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -259,15 +287,16 @@ def write_single_csv(df: DataFrame, final_csv_path: str) -> None:
 
 
 def process_one_file_to_same_name(spark: SparkSession, input_file: str, output_dir: str) -> str:
-    # 1. Determine the exact output path first
+    # Preserve the original filename in the filtered output directory so that
+    # later pipeline stages can match day files by date without extra mapping
     output_path = Path(output_dir) / Path(input_file).name
 
-    # 2. Check if it already exists to bypass Spark processing
+    # Skip work if this day filtered file already exists
     if output_path.exists():
         print(f"Skipped filtering: {output_path} already exists.")
         return str(output_path)
 
-    # 3. If it doesn't exist, run the heavy processing and write the file
+    # Otherwise run the full filter pipeline and write the result
     df = filter_one_file(spark, input_file)
     write_single_csv(df, str(output_path))
 

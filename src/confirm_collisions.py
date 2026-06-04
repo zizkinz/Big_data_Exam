@@ -2,25 +2,27 @@ from pathlib import Path
 import argparse
 import shutil
 
-
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from pyspark.sql import Window
-
 from filter import create_spark, maritime_distance_expr
 
+# Interpolation step in seconds used when evaluating vessel motion between observed points
 INTERPOLATION_STEP_SEC = 1
-CANDIDATE_PAD_SEC = 10 * 60
+# Bounding time intervals before and after alleged collision (10 minutes as defined in the assignment)
 TRACK_WINDOW_SEC = 10 * 60
+# Final confirmation uses a stricter distance threshold than the earlier candidate stage
 EXACT_COLLISION_TOLERANCE_M = 100
 EXACT_COLLISION_TOLERANCE_NM = EXACT_COLLISION_TOLERANCE_M / 1852.0
+
 DEFAULT_FILTERED_DIR = "/app/data/filtered"
 DEFAULT_COLLISIONS_DIR = "/app/data/collisions"
 DEFAULT_OUTPUT_DIR = "/app/data/collision_tracks"
 
 
 def load_filtered_day(spark: SparkSession, file_path: str):
+    # Load the filtered day AIS file and cast the columns needed for
+    # interpolation and distance calculations.
     return (
         spark.read.option("header", True).csv(file_path)
         .withColumn("timestamp", F.to_timestamp("timestamp"))
@@ -35,6 +37,7 @@ def load_filtered_day(spark: SparkSession, file_path: str):
 
 
 def load_collision_candidates(spark: SparkSession, file_path: str):
+    # Read the candidate collision pairs and build a time window around each pair
     return (
         spark.read.option("header", True).csv(file_path)
         .withColumn("timestamp_1", F.to_timestamp("timestamp_1"))
@@ -42,8 +45,8 @@ def load_collision_candidates(spark: SparkSession, file_path: str):
         .withColumn("ts_1", F.col("timestamp_1").cast("long"))
         .withColumn("ts_2", F.col("timestamp_2").cast("long"))
         .withColumn("center_ts", ((F.col("ts_1") + F.col("ts_2")) / 2).cast("long"))
-        .withColumn("window_start", F.least(F.col("ts_1"), F.col("ts_2")) - F.lit(CANDIDATE_PAD_SEC))
-        .withColumn("window_end", F.greatest(F.col("ts_1"), F.col("ts_2")) + F.lit(CANDIDATE_PAD_SEC))
+        .withColumn("window_start", F.least(F.col("ts_1"), F.col("ts_2")) - F.lit(TRACK_WINDOW_SEC))
+        .withColumn("window_end", F.greatest(F.col("ts_1"), F.col("ts_2")) + F.lit(TRACK_WINDOW_SEC))
         .withColumn("pair_id", F.concat_ws("_", F.col("mmsi_1"), F.col("mmsi_2"), F.col("center_ts")))
         .select(
             "pair_id", "mmsi_1", "mmsi_2", "name_1", "name_2",
@@ -51,34 +54,8 @@ def load_collision_candidates(spark: SparkSession, file_path: str):
         )
     )
 
-
-def write_single_csv(df, final_csv_path: str) -> None:
-    final_path = Path(final_csv_path)
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_dir = final_path.with_suffix(".tmpdir")
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
-    if final_path.exists():
-        final_path.unlink()
-
-    (
-        df.coalesce(1)
-          .write
-          .mode("overwrite")
-          .option("header", True)
-          .csv(str(temp_dir))
-    )
-
-    part_files = list(temp_dir.glob("part-*.csv"))
-    if not part_files:
-        raise FileNotFoundError(f"No Spark CSV part file found in temporary directory: {temp_dir}")
-
-    shutil.move(str(part_files[0]), str(final_path))
-    shutil.rmtree(temp_dir)
-
-
 def build_segments(points_df, ts_col_prefix: str):
+    # For each point find the next observed point for the same vessel pair
     start_ts = f"{ts_col_prefix}_start_ts"
     start_lat = f"{ts_col_prefix}_start_lat"
     start_lon = f"{ts_col_prefix}_start_lon"
@@ -131,6 +108,8 @@ def build_segments(points_df, ts_col_prefix: str):
 
 
 def find_confirmed_collision_times(filtered_df, candidates_df):
+    # Pull all filtered AIS points for vessel A and vessel B within each
+    # candidate window, then compare their tracks at one-second steps.
     a_points = (
         candidates_df.alias("p")
         .join(
@@ -171,9 +150,11 @@ def find_confirmed_collision_times(filtered_df, candidates_df):
         .dropDuplicates(["pair_id", "ts_b", "lat_b", "lon_b"])
     )
 
+    # Convert the data points into linear segments
     a_segments = build_segments(a_points, "a")
     b_segments = build_segments(b_points, "b")
 
+    # Keep only segment pairs whose time ranges overlap
     overlapping = (
         a_segments.alias("a")
         .join(
@@ -195,6 +176,7 @@ def find_confirmed_collision_times(filtered_df, candidates_df):
         .withColumn("interp_ts", F.explode("interp_ts"))
     )
 
+    # Linearly interpolate each vessel position at every second in the overlap
     interpolated = (
         overlapping
         .withColumn(
@@ -232,6 +214,8 @@ def find_confirmed_collision_times(filtered_df, candidates_df):
         .filter(F.col("distance_nm") <= F.lit(EXACT_COLLISION_TOLERANCE_NM))
     )
 
+    # Keep the closest interpolated encounter for each candidate pair and use
+    # that timestamp as the confirmed collision time
     confirmed = (
         interpolated.groupBy(F.col("a.pair_id").alias("pair_id"))
         .agg(
@@ -263,6 +247,8 @@ def find_confirmed_collision_times(filtered_df, candidates_df):
 
 
 def extract_collision_tracks(filtered_df, confirmed_df):
+    # Build a 10-minute track window around the confirmed collision for each
+    # vessel in the pair
     vessel_1_tracks = (
         confirmed_df.alias("c")
         .join(
@@ -324,6 +310,7 @@ def extract_collision_tracks(filtered_df, confirmed_df):
     )
 
 def add_sog_proportion(tracks_df):
+    # Compare average speed before and after the collision time for each vessel
     sog_base = tracks_df.select("mmsi", "pair_id", "timestamp", "collision_timestamp", "sog")
 
     sog_stats = (
@@ -341,6 +328,8 @@ def add_sog_proportion(tracks_df):
         .select("mmsi", "pair_id", "sog_proportion")
     )
 
+    # Keep only pairs where the average speed after the collision for both vessels
+    # has decreased by at least 10%
     filtered_stats = (
         sog_stats
         .groupBy("pair_id")
@@ -348,9 +337,7 @@ def add_sog_proportion(tracks_df):
             F.min("sog_proportion").alias("min_pair_proportion"),
             F.avg("sog_proportion").alias("mean_pair_proportion")
         )
-        # Apply your filter condition on the aggregated minimum proportion
         .filter(F.col("min_pair_proportion") >= 1.1)
-        # Select only the pair_id and the mean_pair_proportion
         .select("pair_id", "mean_pair_proportion")
     )
 
@@ -360,7 +347,36 @@ def add_sog_proportion(tracks_df):
     )
 
 
+def write_single_csv(df, final_csv_path: str) -> None:
+    # Combine the temporary Spark files into a single one day output file
+    final_path = Path(final_csv_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_dir = final_path.with_suffix(".tmpdir")
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    if final_path.exists():
+        final_path.unlink()
+
+    (
+        df.coalesce(1)
+          .write
+          .mode("overwrite")
+          .option("header", True)
+          .csv(str(temp_dir))
+    )
+
+    part_files = list(temp_dir.glob("part-*.csv"))
+    if not part_files:
+        raise FileNotFoundError(f"No Spark CSV part file found in temporary directory: {temp_dir}")
+
+    shutil.move(str(part_files[0]), str(final_path))
+    shutil.rmtree(temp_dir)
+
+
 def process_date(spark: SparkSession, date_str: str, filtered_dir: str, collisions_dir: str, output_dir: str):
+    # Preserve the original filename in the filtered output directory so that
+    # later pipeline stages can match day files by date without extra mapping
     output_path = str(Path(output_dir) / f"aisdk-{date_str}.csv")
 
     if Path(output_path).exists():
@@ -375,6 +391,8 @@ def process_date(spark: SparkSession, date_str: str, filtered_dir: str, collisio
     confirmed_df = find_confirmed_collision_times(filtered_df, candidates_df)
     tracks_df = extract_collision_tracks(filtered_df, confirmed_df)
 
+    # localCheckpoint truncates the lineage so the next aggregation does not
+    # repeatedly recompute the long interpolation pipeline
     tracks_df = tracks_df.localCheckpoint(eager=True)
 
     tracks_df = add_sog_proportion(tracks_df)
@@ -389,6 +407,7 @@ def process_date(spark: SparkSession, date_str: str, filtered_dir: str, collisio
 
 
 def parse_args():
+    # Parse the input date and optional directory overrides for batch runs.
     parser = argparse.ArgumentParser(description="Extract AIS trajectory points around confirmed interpolated collisions")
     parser.add_argument("--date", required=True, help="Date string like 2021-12-13")
     parser.add_argument("--filtered-dir", default=DEFAULT_FILTERED_DIR)
@@ -399,6 +418,7 @@ def parse_args():
 
 
 def main():
+    # Create Spark, process the requested day and stop Spark
     args = parse_args()
     spark = create_spark(app_name="ais-collision-tracks", n_cores=args.n_cores)
     try:

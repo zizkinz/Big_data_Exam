@@ -2,20 +2,26 @@ from pathlib import Path
 import shutil
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
 from filter import maritime_distance_expr
 
+
+
+# Vessels must be within 150 meters
 COLLISION_DISTANCE_M = 150.0
 COLLISION_DISTANCE_NM = COLLISION_DISTANCE_M / 1852.0
+# The window for the heavy cross-joins (for time-separation)
 TIME_WINDOW_SEC = 10 * 60
 DEFAULT_COLLISIONS_DIR = "/app/data/collisions"
+# Filter before the cross-join to avoid the heavy distance calculation
+# 0.01 degrees = 1.11 km - fast filter
 LAT_TOLERANCE = 0.01
 LON_TOLERANCE = 0.01
 
 
 def load_filtered_day(spark: SparkSession, file_path: str) -> DataFrame:
+    # Read the filtered day AIS file and cast the columns needed for
+    # collision detection into the proper numeric and timestamp types
     return (
         spark.read.option("header", True).csv(file_path)
         .withColumn("timestamp", F.to_timestamp("timestamp"))
@@ -27,6 +33,8 @@ def load_filtered_day(spark: SparkSession, file_path: str) -> DataFrame:
 
 
 def prepare_candidate_points(df: DataFrame) -> DataFrame:
+    # Keep only the columns needed for pairwise proximity testing and remove
+    # duplicate observations that would otherwise duplicate candidate pairs
     return (
         df.filter(F.col("timestamp").isNotNull())
           .filter(F.col("mmsi").isNotNull())
@@ -42,17 +50,20 @@ from pyspark.sql import functions as F
 def find_collision_candidates(df: DataFrame) -> DataFrame:
     base_points = prepare_candidate_points(df)
 
-    # 1. Create the sliding 20-minute windows (sliding every 10 minutes)
+    # Assign each point to two overlapping 10-minute windows
+    # This creates an efficient sliding 20-minute search windows so that points
+    # near a window boundary can still be matched without a full cross-join
+
     windows_df = (
         base_points
         .withColumn("epoch_10m", F.floor(F.col("timestamp").cast("long") / TIME_WINDOW_SEC))
         .withColumn("window_id", F.explode(F.array(F.col("epoch_10m"), F.col("epoch_10m") - 1)))
     )
 
-    # Side A keeps original names
+    # Left side of the cross-join keeps original column names
     df_a = windows_df
 
-    # Side B gets explicitly prefixed names to prevent PySpark join ambiguity
+    # Right side is explicitly prefixed so that later jobs clearly distinguish vessel A vs vessel B
     df_b = windows_df.select(
         F.col("window_id").alias("b_window_id"),
         F.col("mmsi").alias("b_mmsi"),
@@ -64,31 +75,33 @@ def find_collision_candidates(df: DataFrame) -> DataFrame:
         F.col("navigational_status").alias("b_status")
     )
 
-    # 2. Optimized Equi-Join using unique column names
+    # Cross-join candidate points inside the same sliding window.
+    # The mmsi < b_mmsi condition prevents mirrored duplicates.
+    # The latitude/longitude tolerances act as a fast spatial filter before
+    # running the expensive exact haversine distance calculation
     joined = df_a.join(
         df_b,
         on=(
                 (F.col("window_id") == F.col("b_window_id")) &
                 (F.col("mmsi") < F.col("b_mmsi")) &
-                # The Magic: Drop ships that are far apart before the join finishes
                 (F.abs(F.col("latitude") - F.col("b_latitude")) <= LAT_TOLERANCE) &
                 (F.abs(F.col("longitude") - F.col("b_longitude")) <= LON_TOLERANCE)
         ),
         how="inner",
     )
 
-    # 3. Deduplicate: This now works perfectly because all string columns are unique
+    # Remove duplicate pairs caused by overlapping sliding windows
     unique_pairs = joined.dropDuplicates([
         "mmsi", "b_mmsi", "timestamp", "b_timestamp"
     ])
 
-    # 4. Strict time filter and distance calculation
+    # Add the strict time-window constraint and compute exact distance between the vessels
     with_distance = (
         unique_pairs.withColumn(
             "time_diff_sec",
             F.abs(F.col("timestamp").cast("long") - F.col("b_timestamp").cast("long"))
         )
-        .filter(F.col("time_diff_sec") <= TIME_WINDOW_SEC) # Ensure strictly <= 10 mins
+        .filter(F.col("time_diff_sec") <= TIME_WINDOW_SEC)
         .withColumn(
             "distance_nm",
             maritime_distance_expr(
@@ -101,10 +114,11 @@ def find_collision_candidates(df: DataFrame) -> DataFrame:
         .withColumn("distance_m", F.col("distance_nm") * F.lit(1852.0))
     )
 
-    # 5. Filter by collision distance
+    # Keep only pairs that are within the collision distance threshold
     candidates = with_distance.filter(F.col("distance_nm") <= F.lit(COLLISION_DISTANCE_NM))
 
-    # 6. Keep only the absolute closest point per vessel pair
+    # Some vessel pairs may appear multiple times within the search window
+    # Keep only the closest appearence for each pair
     pair_window = Window.partitionBy(
         F.col("mmsi"), F.col("b_mmsi")
     ).orderBy(
@@ -139,6 +153,7 @@ def find_collision_candidates(df: DataFrame) -> DataFrame:
 
 
 def write_single_csv(df: DataFrame, final_csv_path: str) -> None:
+    # Combine the temporary Spark files into a single one day output file
     final_path = Path(final_csv_path)
     final_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -165,13 +180,16 @@ def write_single_csv(df: DataFrame, final_csv_path: str) -> None:
 
 
 def process_one_filtered_file(spark: SparkSession, input_file: str,output_dir: str = DEFAULT_COLLISIONS_DIR) -> str:
-
+    # Preserve the original filename in the filtered output directory so that
+    # later pipeline stages can match day files by date without extra mapping
     output_path = Path(output_dir) / Path(input_file).name
 
+    # Skip work if this day collisions file already exists
     if output_path.exists():
         print(f"Skipped collision finding: {output_path} already exists.")
         return str(output_path)
 
+    # Otherwise run the full collision-candidate detection pipeline and write the result
     df = load_filtered_day(spark, input_file)
     collisions = find_collision_candidates(df)
 

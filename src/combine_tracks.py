@@ -6,6 +6,7 @@ from pyspark.sql import functions as F
 
 
 def write_single_csv(df, final_csv_path: str) -> None:
+    # Combine the temporary Spark files into a single one day output file
     final_path = Path(final_csv_path)
     final_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -33,8 +34,8 @@ def write_single_csv(df, final_csv_path: str) -> None:
 
 def combine_and_sort_tracks(spark: SparkSession, input_dir: str, output_csv_path: str) -> str:
     """
-    Reads all daily collision track CSVs, sorts them globally by severity (mean_pair_proportion),
-    and writes them to a single master CSV.
+    Reads all daily collision track CSVs, sorts them globally by severity (mean_pair_proportion)
+    and writes them to a single final CSV
     """
     input_path = str(Path(input_dir) / "*.csv")
 
@@ -46,11 +47,11 @@ def combine_and_sort_tracks(spark: SparkSession, input_dir: str, output_csv_path
         raw_df
         .withColumn("mean_pair_proportion", F.col("mean_pair_proportion").cast("double"))
         .orderBy(
-            F.col("mean_pair_proportion").desc_nulls_last(),  # Heaviest collisions at the top
-            F.col("collision_timestamp"),  # Group the incident tightly
+            F.col("mean_pair_proportion").desc_nulls_last(),
+            F.col("collision_timestamp"),
             F.col("pair_id"),
-            F.col("vessel_in_pair"),  # Show Vessel 1 then Vessel 2
-            F.col("timestamp")  # Chronological track points
+            F.col("vessel_in_pair"),
+            F.col("timestamp")
         )
     )
 
